@@ -1,0 +1,426 @@
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+
+RF24 radio(17, 10); // Đối tượng RF24 để giao tiếp với module nRF24L01, sử dụng chân CE (A3) và CSN (D10)
+const byte address[6] = "00001"; // Địa chỉ giao tiếp cho module nRF24L01
+bool isConnected = false; // Trạng thái kết nối với tay cầm (true: đã kết nối, false: chưa kết nối)
+int mode = -1; // Chế độ hoạt động: -1 (chưa chọn), 0 (điều khiển tay), 1 (dò line tự động)
+unsigned long lastLogTime = 0; // Thời điểm in log gần nhất (ms), dùng để kiểm soát tần suất in thông tin
+unsigned long lastAvoidTime = 0; // Thời điểm né vật cản gần nhất (ms), để đảm bảo thời gian chờ giữa các lần né
+const unsigned long logInterval = 100; // Khoảng thời gian giữa các lần in log (ms)
+
+// Hằng số encoder và tốc độ
+const int PULSES_PER_REV = 1440; // Số xung encoder cho một vòng quay của bánh xe
+const int PULSES_FOR_90_DEG = 100; // Số xung encoder cần để quay 90 độ
+const int PULSES_FOR_10CM = 705; // Số xung encoder cần để di chuyển 10cm
+const unsigned long DEBOUNCE_DELAY = 100; // Thời gian chống nhiễu cho encoder (microseconds)
+volatile long encoderCount = 0; // Biến đếm xung encoder, tăng/giảm dựa trên hướng quay
+bool isAvoidingObstacle = false; // Trạng thái né vật cản (true: đang né, false: không né)
+float lastLinePosition = 0; // Vị trí line cuối cùng được ghi nhận, dùng để quyết định hướng quay khi mất line
+float baseSpeed = 80; // Tốc độ cơ bản của động cơ
+const int minSpeed = -120; // Tốc độ tối thiểu của động cơ (âm cho lùi)
+const int maxSpeed = 120; // Tốc độ tối đa của động cơ
+
+// Cấu trúc dữ liệu nhận từ tay cầm
+struct DataPacket {
+  int joystickX, joystickY; // Tọa độ X, Y của joystick trên tay cầm
+  bool buttonA, buttonB, buttonC, buttonD, buttonE, buttonF; // Trạng thái các nút trên tay cầm
+  bool ping; // Tín hiệu ping để kiểm tra kết nối
+} data;
+#define TRIG_PIN A5      // Chân phát tín hiệu siêu âm của cảm biến khoảng cách (HC-SR04)
+#define ECHO_PIN A4      // Chân nhận tín hiệu siêu âm từ cảm biến khoảng cách (HC-SR04)
+#define OBSTACLE_DISTANCE 7.0 // Khoảng cách tối thiểu (cm) để phát hiện vật cản
+#define ENCODER_A 2      // Chân A của encoder (cảm biến quay) để đếm xung quay
+#define ENCODER_B 3      // Chân B của encoder để xác định hướng quay
+#define LED_PIN 4        // Chân điều khiển LED để báo hiệu trạng thái (nháy LED)
+#define IN1 6            // Chân điều khiển động cơ phải (Motor Right), tín hiệu 1
+#define IN2 7            // Chân điều khiển động cơ phải (Motor Right), tín hiệu 2
+#define IN3 8            // Chân điều khiển động cơ trái (Motor Left), tín hiệu 1
+#define IN4 9            // Chân điều khiển động cơ trái (Motor Left), tín hiệu 2
+#define LINE_OUT1 A0     // Chân cảm biến dò line 1 (trái nhất)
+#define LINE_OUT2 A1     // Chân cảm biến dò line 2
+#define LINE_OUT3 A2     // Chân cảm biến dò line 3 (giữa)
+#define LINE_OUT4 A6     // Chân cảm biến dò line 4
+#define LINE_OUT5 A7     // Chân cảm biến dò line 5 (phải nhất)
+void readLineSensors(int sensors[5], int &sum) {
+  sensors[0] = analogRead(LINE_OUT1) > 500;
+  sensors[1] = analogRead(LINE_OUT2) > 500;
+  sensors[2] = analogRead(LINE_OUT3) > 500;
+  sensors[3] = analogRead(LINE_OUT4) > 500;
+  sensors[4] = analogRead(LINE_OUT5) > 500;
+  sum = sensors[0] + sensors[1] + sensors[2] + sensors[3] + sensors[4];
+}
+
+// Print line status
+void printLineStatus(int sensors[5], int lineStatus, const char* msg) {
+  Serial.print("Line Status: "); Serial.print(lineStatus);
+  for (int i = 0; i < 5; i++) {
+    Serial.print(" | S"); Serial.print(i + 1); Serial.print(": "); Serial.print(sensors[i]);
+  }
+  Serial.println(msg);
+}
+
+// Motor control
+void setMotor(int pin1, int pin2, int speed) {
+  digitalWrite(pin1, speed > 0 ? HIGH : LOW);
+  digitalWrite(pin2, speed < 0 ? HIGH : LOW);
+}
+
+void Motor_left(int speed) { setMotor(IN3, IN4, speed); }
+void Motor_right(int speed) { setMotor(IN1, IN2, speed); }
+void stopMotors() { Motor_left(0); Motor_right(0); }
+void moveForward() { Motor_left(baseSpeed); Motor_right(baseSpeed); }
+void moveBackward() { Motor_left(-baseSpeed); Motor_right(-baseSpeed); }
+void turnLeft() { Motor_left(-baseSpeed); Motor_right(baseSpeed); }
+void turnRight() { Motor_left(baseSpeed); Motor_right(-baseSpeed); }
+
+bool moveForwardTime(unsigned long duration) {
+  unsigned long startTime = millis();
+  encoderCount = 0;
+  moveForward();
+  Serial.println("Tiến thẳng...");
+  while (millis() - startTime < duration && abs(encoderCount) < PULSES_FOR_10CM);
+  stopMotors();
+  Serial.print("Hoàn thành tiến thẳng, Thời gian: "); 
+  Serial.print(millis() - startTime); 
+  Serial.print(" ms, Số xung: "); 
+  Serial.println(abs(encoderCount));
+  return true;
+}
+
+// Encoder
+void encoderSetup() {
+  pinMode(ENCODER_A, INPUT_PULLUP);
+  pinMode(ENCODER_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_A), encoderISR, RISING);
+}
+
+void encoderISR() {
+  static unsigned long lastInterruptTime = 0;
+  unsigned long currentTime = micros();
+  if (currentTime - lastInterruptTime < DEBOUNCE_DELAY) return;
+  encoderCount += digitalRead(ENCODER_B) ? 1 : -1;
+  lastInterruptTime = currentTime;
+}
+
+// Turn 90 degrees
+bool turn90Degrees(bool isRight) {
+  encoderCount = 0;
+  unsigned long startTime = millis();
+  Serial.println(isRight ? "Quay phải 90 độ..." : "Quay trái 90 độ...");
+  isRight ? Motor_right(baseSpeed) : Motor_left(baseSpeed);
+  while (abs(encoderCount) < PULSES_FOR_90_DEG && millis() - startTime < 1000);
+  stopMotors();
+  Serial.print("Hoàn thành quay "); Serial.print(isRight ? "phải" : "trái");
+  Serial.print(" 90 độ, Thời gian: "); Serial.print(millis() - startTime);
+  Serial.print(" ms, Số xung: "); Serial.println(abs(encoderCount));
+  return true;
+}
+
+// Ultrasonic sensor
+void ultrasonicSetup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+}
+
+float getDistance() {
+  static float lastValidDistance = 999;
+  static unsigned long lastMeasureTime = 0;
+  if (millis() - lastMeasureTime < 20) return lastValidDistance;
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  float distance = duration * 0.034 / 2;
+  if (duration == 0 || distance < 3 || distance > 34) return lastValidDistance;
+  lastValidDistance = distance;
+  lastMeasureTime = millis();
+  return distance;
+}
+
+// Line sensor setup
+void lineSensorSetup() {
+  pinMode(LINE_OUT1, INPUT); pinMode(LINE_OUT2, INPUT);
+  pinMode(LINE_OUT3, INPUT); pinMode(LINE_OUT4, INPUT);
+  pinMode(LINE_OUT5, INPUT);
+}
+
+// LED
+void ledSetup() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void blinkLED(int times) {
+  while (times--) {
+    digitalWrite(LED_PIN, HIGH); delay(200);
+    digitalWrite(LED_PIN, LOW); delay(200);
+  }
+}
+
+// Check line
+bool checkLine(int sensors[5], int &sum) {
+  readLineSensors(sensors, sum);
+  if (sum < 5) {
+    printLineStatus(sensors, 0, " | Tìm thấy line, tiếp tục bám line");
+    stopMotors();
+    return true;
+  }
+  return false;
+}
+
+// Line following
+float getLinePosition(int &lineStatus, int sensors[5]) {
+  int sum;
+  readLineSensors(sensors, sum);
+  if (sum == 5) {
+    lineStatus = 1;
+    return -1;
+  } else if (sum == 0) {
+    lineStatus = 2;
+    return -1;
+  }
+  lineStatus = 0;
+  return (sensors[0] * -2 + sensors[1] * -1 + sensors[3] * 1 + sensors[4] * 2) / (float)(5 - sum);
+}
+
+void followLine() {
+  if (mode != 1) return;
+
+  static bool stateInitialized = false;
+  static unsigned long stateStartTime = 0, avoidStartTime = 0;
+  static int obstacleState = 0;
+  float distance = getDistance();
+  int sensors[5], sum;
+
+  if (millis() - lastAvoidTime > 2000 && distance >= 4 && distance <= 8) {
+    stopMotors();
+    isAvoidingObstacle = true;
+    obstacleState = 1;
+    stateInitialized = false;
+    Serial.println("Phát hiện vật cản, chuyển sang né tránh");
+  }
+
+  if (isAvoidingObstacle) {
+    if (!stateInitialized) {
+      stateStartTime = avoidStartTime = millis();
+      stateInitialized = true;
+    }
+    switch (obstacleState) {
+      case 1: moveBackward(); delay(500); obstacleState = 2; stateInitialized = false; break;
+      case 2: turnLeft(); delay(300); obstacleState = 3; stateInitialized = false; break;
+      case 3: moveForwardTime(2000); obstacleState = 4; stateInitialized = false; break;
+      case 4: turnRight(); delay(500); obstacleState = 5; stateInitialized = false; break;
+      case 5:
+        moveForward();
+        if (millis() - stateStartTime > 100 && checkLine(sensors, sum)) {
+          isAvoidingObstacle = false;
+          obstacleState = 0;
+          lastAvoidTime = millis();
+          stateInitialized = false;
+          Serial.println("Né xong, về lại dò line");
+        }
+        break;
+    }
+    return;
+  }
+
+  int lineStatus = 1;
+  float linePosition = getLinePosition(lineStatus, sensors);
+  if (lineStatus == 0) lastLinePosition = linePosition;
+
+  if (lineStatus == 2) {
+    printLineStatus(sensors, 2, " | Tất cả trên line, dừng xe");
+    stopMotors();
+    return;
+  }
+
+  if (lineStatus == 1) {
+    printLineStatus(sensors, 1, " | Mất line, bắt đầu tìm line");
+    unsigned long startTime = millis(), lastLineCheck = 0;
+    const unsigned long lineCheckInterval = 10;
+    bool lineFound = false;
+
+    moveForward();
+    while (millis() - startTime < 2000) {
+      distance = getDistance();
+      if (distance < OBSTACLE_DISTANCE && distance > 0) {
+        stopMotors();
+        isAvoidingObstacle = true;
+        obstacleState = 0;
+        stateInitialized = false;
+        Serial.println("Phát hiện vật cản khi tìm line, chuyển sang né tránh");
+        return;
+      }
+      if (millis() - lastLineCheck >= lineCheckInterval && checkLine(sensors, sum)) {
+        lineFound = true;
+        break;
+      }
+      lastLineCheck = millis();
+    }
+
+    if (!lineFound) {
+      stopMotors();
+      Serial.println("Hết 2s, vẫn mất line, quyết định quay dựa vào lastLinePosition");
+      Serial.print("lastLinePosition: "); Serial.println(lastLinePosition);
+
+      startTime = millis();
+      bool isTurning = true;
+      (lastLinePosition >= 0) ? turnLeft() : turnRight();
+      Serial.println(lastLinePosition >= 0 ? "Quay trái để tìm line..." : "Quay phải để tìm line...");
+
+      while (millis() - startTime < 2000) {
+        if (millis() - startTime > 1000 && isTurning) {
+          Serial.println("Hoàn thành quay, chuyển sang chạy thẳng...");
+          moveForward();
+          isTurning = false;
+        }
+        if (millis() - lastLineCheck >= lineCheckInterval && checkLine(sensors, sum)) {
+          lineFound = true;
+          break;
+        }
+        lastLineCheck = millis();
+      }
+
+      if (!lineFound) {
+        stopMotors();
+        Serial.println("Vẫn không tìm thấy line sau khi quay và chạy thẳng, dừng xe");
+      }
+    }
+    return;
+  }
+
+  int leftSpeed = baseSpeed, rightSpeed = baseSpeed;
+  if (sensors[2] == 0) {
+    if (sensors[0] == 0 && sensors[1] == 0) {
+      printLineStatus(sensors, 0, " | Góc phải, xoay phải 90 độ");
+      stopMotors(); delay(1000);
+      turn90Degrees(true);
+      return;
+    } else if (sensors[3] == 0 && sensors[4] == 0) {
+      printLineStatus(sensors, 0, " | Góc trái, xoay trái 90 độ");
+      stopMotors(); delay(1000);
+      turn90Degrees(false);
+      return;
+    }
+  } else if (sensors[4] == 0 || sensors[3] == 0) {
+    leftSpeed = baseSpeed + 30;
+    rightSpeed = 0;
+  } else if (sensors[0] == 0 || sensors[1] == 0) {
+    leftSpeed = 0;
+    rightSpeed = baseSpeed + 30;
+  }
+
+  leftSpeed = constrain(leftSpeed, minSpeed, maxSpeed);
+  rightSpeed = constrain(rightSpeed, minSpeed, maxSpeed);
+
+  distance = getDistance();
+  if (distance < OBSTACLE_DISTANCE && distance > 0) {
+    stopMotors();
+    isAvoidingObstacle = true;
+    obstacleState = 0;
+    stateInitialized = false;
+    Serial.println("Phát hiện vật cản khi bám line, chuyển sang né tránh");
+    return;
+  }
+
+  Motor_left(leftSpeed);
+  Motor_right(rightSpeed);
+
+  if (millis() - lastLogTime >= logInterval) {
+    Serial.print("Mode: "); Serial.print(mode);
+    Serial.print(" | Line Status: "); Serial.print(lineStatus);
+    for (int i = 0; i < 5; i++) {
+      Serial.print(" | S"); Serial.print(i + 1); Serial.print(": "); Serial.print(sensors[i]);
+    }
+    Serial.print(" | Left Speed: "); Serial.print(leftSpeed);
+    Serial.print(" | Right Speed: "); Serial.print(rightSpeed);
+    Serial.print(" | Distance: "); Serial.print(distance);
+    Serial.println(" cm");
+    lastLogTime = millis();
+  }
+}
+
+// Manual control
+void manualControl() {
+  if (mode != 0) return;
+  if (data.buttonA) {
+    moveForward();
+    Serial.println("Nút A: Tiến");
+  } else if (data.buttonB) {
+    turnRight();
+    Serial.println("Nút B: Xoay phải");
+  } else if (data.buttonC) {
+    moveBackward();
+    Serial.println("Nút C: Lùi");
+  } else if (data.buttonD) {
+    turnLeft();
+    Serial.println("Nút D: Xoay trái");
+  } else {
+    stopMotors();
+    Serial.println("Thả tay: Dừng động cơ");
+  }
+}
+
+// Setup and loop
+void setup() {
+  Serial.begin(115200);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  stopMotors();
+  ultrasonicSetup();
+  encoderSetup();
+  ledSetup();
+  radio.begin();
+  radio.openReadingPipe(0, address);
+  radio.openWritingPipe(address);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setDataRate(RF24_2MBPS);
+  radio.setRetries(1, 1);
+  radio.startListening();
+  Serial.println("Đang chờ kết nối với tay cầm...");
+}
+
+void loop() {
+  if (!isConnected) {
+    if (radio.available()) {
+      radio.read(&data, sizeof(DataPacket));
+      if (data.ping) {
+        Serial.println("Nhận tín hiệu từ tay cầm, phản hồi...");
+        radio.stopListening();
+        radio.write(&data, sizeof(DataPacket));
+        radio.startListening();
+        isConnected = true;
+        Serial.println("Đã kết nối thành công với tay cầm!");
+      }
+    }
+  } else if (radio.available()) {
+    radio.read(&data, sizeof(DataPacket));
+    if (millis() - lastLogTime >= logInterval) {
+      Serial.print("Joystick X: "); Serial.print(data.joystickX);
+      Serial.print(" | Joystick Y: "); Serial.print(data.joystickY);
+      Serial.print(" | A: "); Serial.print(data.buttonA);
+      Serial.print(" | B: "); Serial.print(data.buttonB);
+      Serial.print(" | C: "); Serial.print(data.buttonC);
+      Serial.print(" | D: "); Serial.print(data.buttonD);
+      Serial.print(" | E: "); Serial.print(data.buttonE);
+      Serial.print(" | F: "); Serial.println(data.buttonF);
+      lastLogTime = millis();
+    }
+
+    if (data.buttonE && mode != 1) {
+      mode = 1;
+      Serial.println("Đã chọn chế độ tự động (dò line)");
+      blinkLED(1);
+      lineSensorSetup();
+    }
+    if (data.buttonF && mode != 0) {
+      mode = 0;
+      Serial.println("Đã chọn chế độ điều khiển tay");
+      blinkLED(2);
+    }
+
+    mode == 1 ? followLine() : manualControl();
+  }
+}
