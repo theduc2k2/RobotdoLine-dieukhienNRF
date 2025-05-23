@@ -544,7 +544,7 @@ void followLine() {
     Serial.print(" | S1: "); Serial.print(s1);
     Serial.print(" | S2: "); Serial.print(s2);
     Serial.print(" | S3: "); Serial.print(s3);
-    Serial.print(" | S4: "); Serial.print(s4)
+    Serial.print(" | S4: "); Serial.print(s4);
     Serial.print(" | S5: "); Serial.print(s5);
     Serial.print(" | Left Speed: "); Serial.print(leftSpeed);
     Serial.print(" | Right Speed: "); Serial.print(rightSpeed);
